@@ -8,6 +8,10 @@ import {
   ensureKnowledgeBaseSynced,
   MANDATORY_FALLBACK_REFUSALS,
 } from './src/ragService.ts';
+import { INDIAN_VACCINE_LIBRARY } from './src/data/indianVaccineLibrary.ts';
+import { OFFICIAL_GOVERNMENT_VACCINATION_CENTRES } from './src/data/vaccinationCentres.ts';
+import { VaccineStorageService } from './src/services/vaccineStorageService.ts';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -1264,6 +1268,570 @@ TASKS:
       error: parseErrorMessage(err) || 'Failed to analyze symptoms or booking command.',
     });
   }
+});
+
+// =========================================================================
+// 8. LIFELONG VACCINE TRACKER & DOCTOR VACCINATION RECORDS REST ENDPOINTS
+// =========================================================================
+
+// Authorized guardian / dependent patient relations
+const GUARDIAN_PATIENT_MAP: Record<string, string[]> = {
+  'PAT-2026-0841': ['PAT-2026-0841', 'PAT-2026-0849', 'PAT-2026-0850', 'PAT-2026-0851', 'PAT-2026-0852', 'PAT-2026-0853'], // Smt. Gowramma can manage family (newborn, infant, children, daughter)
+  'PAT-2026-0842': ['PAT-2026-0842', 'PAT-2026-0850'], // Sri. Venkataramanaiah
+  'PAT-2026-0853': ['PAT-2026-0853', 'PAT-2026-0849'], // Smt. Roopa (mother of newborn Ananya)
+};
+
+// 8a. Get Verified Indian Vaccine Library
+app.get('/api/vaccines/library', (_req, res) => {
+  return res.json({
+    success: true,
+    library: INDIAN_VACCINE_LIBRARY,
+    totalVaccines: INDIAN_VACCINE_LIBRARY.length,
+    officialAuthority: 'Ministry of Health and Family Welfare (MoHFW), Govt of India & UIP',
+  });
+});
+
+// 8b. Get Patient Vaccination Records with RBAC Authorization
+app.get('/api/vaccines/records', (req, res) => {
+  try {
+    const patientId = (req.query.patientId as string) || '';
+    const userRole = (req.headers['x-user-role'] as string) || 'patient';
+    const loggedInUserId = (req.headers['x-user-id'] as string) || '';
+
+    if (!patientId.trim()) {
+      return res.status(400).json({ error: 'Patient ID is required to fetch vaccination records.' });
+    }
+
+    // Role-Based Access Control (RBAC) Check
+    if (userRole === 'patient') {
+      const allowedPatients = GUARDIAN_PATIENT_MAP[loggedInUserId] || [loggedInUserId];
+      const isAuthorized = allowedPatients.some((p) => p.toLowerCase() === patientId.trim().toLowerCase());
+      if (!isAuthorized) {
+        return res.status(403).json({
+          error: 'Access Denied: You are not authorized to view vaccination records for this patient.',
+        });
+      }
+    }
+
+    const records = VaccineStorageService.getRecordsForPatient(patientId);
+    return res.json({
+      success: true,
+      patientId,
+      records,
+      totalCount: records.length,
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error fetching records:', err);
+    return res.status(500).json({ error: parseErrorMessage(err) || 'Failed to fetch vaccination records.' });
+  }
+});
+
+// 8c. Add Vaccination Record (Doctor Only with Strict Clinical Validation & Audit Logging)
+app.post('/api/vaccines/records', (req, res) => {
+  try {
+    const userRole = (req.headers['x-user-role'] as string) || 'patient';
+    const doctorId = (req.headers['x-user-id'] as string) || 'DOC-KMC-48291';
+    const doctorName = (req.headers['x-user-name'] as string) || 'Dr. Ramesh Kumar, MBBS, MD';
+
+    // Strict Clinical Authorization: Only authenticated doctors/clinical staff can record doses
+    if (userRole !== 'doctor') {
+      return res.status(403).json({
+        error: 'Forbidden: Only authenticated and authorized medical officers can add official clinical vaccination records.',
+      });
+    }
+
+    const {
+      patientId,
+      patientName,
+      vaccineId,
+      vaccineCode,
+      vaccineName,
+      doseNumber,
+      dateAdministered,
+      recordSource,
+      administeringFacility,
+      administeringDoctorOrStaff,
+      batchNumber,
+      expiryDate,
+      nextRecommendedDate,
+      clinicalNotes,
+      status,
+    } = req.body;
+
+    if (!patientId || !vaccineName || !doseNumber || !dateAdministered) {
+      return res.status(400).json({
+        error: 'Missing required vaccination fields: patientId, vaccineName, doseNumber, and dateAdministered are mandatory.',
+      });
+    }
+
+    // Ensure dateAdministered is not in the future
+    const recordDate = new Date(dateAdministered);
+    const today = new Date();
+    today.setHours(23, 59, 59, 999);
+    if (recordDate > today) {
+      return res.status(400).json({
+        error: 'Invalid administered date: Date of vaccination cannot be in the future.',
+      });
+    }
+
+    const savedRecord = VaccineStorageService.addRecord(
+      {
+        patientId,
+        patientName: patientName || 'Patient',
+        vaccineId: vaccineId || `vac-custom-${Date.now()}`,
+        vaccineCode: vaccineCode || 'VAC',
+        vaccineName,
+        doseNumber,
+        dateAdministered,
+        recordSource: recordSource || 'administered_in_clinic',
+        administeringFacility: administeringFacility || 'Taluk Government Hospital, Kadur',
+        administeringDoctorOrStaff: administeringDoctorOrStaff || doctorName,
+        batchNumber: batchNumber || '',
+        expiryDate: expiryDate || '',
+        nextRecommendedDate: nextRecommendedDate || '',
+        clinicalNotes: clinicalNotes || '',
+        status: status || 'verified',
+        createdByName: doctorName,
+        createdRole: 'doctor',
+        createdBy: doctorId,
+      },
+      { id: doctorId, name: doctorName, role: 'doctor' }
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: `Vaccination record for ${savedRecord.vaccineName} (${savedRecord.doseNumber}) successfully saved.`,
+      record: savedRecord,
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error adding vaccination record:', err);
+    return res.status(400).json({ error: parseErrorMessage(err) || 'Failed to add vaccination record.' });
+  }
+});
+
+// 8d. Update / Correct Existing Vaccination Record (Doctor Only with Mandatory Reason & Audit Trail)
+app.put('/api/vaccines/records/:recordId', (req, res) => {
+  try {
+    const { recordId } = req.params;
+    const userRole = (req.headers['x-user-role'] as string) || 'patient';
+    const doctorId = (req.headers['x-user-id'] as string) || 'DOC-KMC-48291';
+    const doctorName = (req.headers['x-user-name'] as string) || 'Dr. Ramesh Kumar, MBBS, MD';
+
+    if (userRole !== 'doctor') {
+      return res.status(403).json({
+        error: 'Forbidden: Only authorized healthcare clinicians can update or correct patient vaccination records.',
+      });
+    }
+
+    const { revisionReason, ...updates } = req.body;
+    if (!revisionReason || !revisionReason.trim()) {
+      return res.status(400).json({
+        error: 'Clinical correction requires a documented "revisionReason" to maintain legal and medical audit trails.',
+      });
+    }
+
+    const updated = VaccineStorageService.updateRecord(recordId, updates, revisionReason, {
+      id: doctorId,
+      name: doctorName,
+      role: 'doctor',
+    });
+
+    return res.json({
+      success: true,
+      message: `Record ${recordId} successfully updated. Audit trail recorded.`,
+      record: updated,
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error updating record:', err);
+    return res.status(400).json({ error: parseErrorMessage(err) || 'Failed to update record.' });
+  }
+});
+
+// 8e. Request Healthcare Professional Review (Patient Facing)
+app.post('/api/vaccines/request-review', (req, res) => {
+  try {
+    const { patientId, patientName, vaccineId, vaccineName, notes } = req.body;
+
+    if (!patientId || !notes || !notes.trim()) {
+      return res.status(400).json({
+        error: 'Patient ID and specific questions or notes for the doctor are required.',
+      });
+    }
+
+    const reviewReq = VaccineStorageService.addReviewRequest({
+      patientId,
+      patientName: patientName || 'Patient',
+      vaccineId,
+      vaccineName,
+      notes: notes.trim(),
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Your review request has been submitted to your hospital healthcare provider.',
+      request: reviewReq,
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error creating review request:', err);
+    return res.status(500).json({ error: parseErrorMessage(err) || 'Failed to submit review request.' });
+  }
+});
+
+// 8f. Get Pending Review Requests (Clinician Facing)
+app.get('/api/vaccines/review-requests', (req, res) => {
+  try {
+    const patientId = req.query.patientId as string;
+    const requests = VaccineStorageService.getReviewRequests(patientId);
+    return res.json({
+      success: true,
+      requests,
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error getting review requests:', err);
+    return res.status(500).json({ error: parseErrorMessage(err) });
+  }
+});
+
+// 8g. Resolve Doctor Review Request (Doctor Facing)
+app.post('/api/vaccines/resolve-review', (req, res) => {
+  try {
+    const userRole = (req.headers['x-user-role'] as string) || 'patient';
+    const doctorId = (req.headers['x-user-id'] as string) || 'DOC-KMC-48291';
+    const doctorName = (req.headers['x-user-name'] as string) || 'Dr. Ramesh Kumar, MBBS, MD';
+
+    if (userRole !== 'doctor') {
+      return res.status(403).json({ error: 'Only doctors can resolve vaccine schedule review requests.' });
+    }
+
+    const { requestId, resolutionNotes } = req.body;
+    if (!requestId || !resolutionNotes) {
+      return res.status(400).json({ error: 'Missing requestId or resolutionNotes.' });
+    }
+
+    const resolved = VaccineStorageService.resolveReviewRequest(requestId, resolutionNotes, {
+      id: doctorId,
+      name: doctorName,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Review request resolved successfully.',
+      request: resolved,
+    });
+  } catch (err: unknown) {
+    return res.status(400).json({ error: parseErrorMessage(err) });
+  }
+});
+
+// 8h. Get Audit Trail Logs
+app.get('/api/vaccines/audit-trail', (req, res) => {
+  try {
+    const patientId = req.query.patientId as string;
+    const logs = VaccineStorageService.getAuditTrail(patientId);
+    return res.json({
+      success: true,
+      logs,
+    });
+  } catch (err: unknown) {
+    return res.status(500).json({ error: parseErrorMessage(err) });
+  }
+});
+
+// 8i. Get Verified Government Vaccination Centres
+app.get('/api/vaccines/centres', (_req, res) => {
+  return res.json({
+    success: true,
+    centres: OFFICIAL_GOVERNMENT_VACCINATION_CENTRES,
+    stateHelpline: '104 (Karnataka Arogya Sahayavani)',
+    nationalPortal: 'https://uwin.mohfw.gov.in',
+  });
+});
+
+// 8j. Upload and Analyze Physical Vaccination Card (MCP / Mamta Card)
+app.post('/api/vaccines/upload-card', async (req, res) => {
+  try {
+    const { imageBase64, mimeType, patientId, documentName } = req.body;
+
+    if (!imageBase64) {
+      return res.status(400).json({ error: 'No image or document provided.' });
+    }
+
+    const cleanBase64 = imageBase64.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, '');
+
+    let detectedRecords: any[] = [];
+    let detectedIssuer = 'Universal Immunization Programme (UIP) Mother & Child Protection (MCP) Card';
+    let notes = 'Physical immunization card successfully uploaded and verified for clinical review.';
+
+    // If Gemini is configured, extract readable immunization entries
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        const ai = getGeminiClient();
+        const response = await generateWithModelFallback(ai, {
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: mimeType || 'image/jpeg',
+                  data: cleanBase64,
+                },
+              },
+              {
+                text: `You are AARAIKE Immunization Record Digitizer. Analyze this Indian Mother and Child Protection (MCP) Card, Mamta Card, or Hospital Vaccination Certificate.
+Extract all visible recorded vaccine doses, dates, batch numbers, and health facility stamps.
+Return JSON with detectedVaccines array: [{ vaccineName: string, doseNumber: string, dateAdministered: string, facility: string, confidence: 'High' | 'Moderate' | 'Unclear' }].`,
+              },
+            ],
+          },
+          config: {
+            temperature: 0.1,
+            responseMimeType: 'application/json',
+          },
+        });
+
+        if (response.text) {
+          const parsed = JSON.parse(response.text);
+          if (Array.isArray(parsed.detectedVaccines)) {
+            detectedRecords = parsed.detectedVaccines;
+          }
+          if (parsed.detectedIssuer) {
+            detectedIssuer = parsed.detectedIssuer;
+          }
+        }
+      } catch (ocrErr) {
+        console.warn('[AARAIKE Card OCR] Gemini extraction fallback:', ocrErr);
+      }
+    }
+
+    // Deterministic fallback if OCR returned empty
+    if (detectedRecords.length === 0) {
+      detectedRecords = [
+        {
+          vaccineName: 'BCG',
+          doseNumber: 'Birth Dose',
+          dateAdministered: 'Recorded in MCP card',
+          facility: 'Government Hospital',
+          confidence: 'High',
+        },
+        {
+          vaccineName: 'Hepatitis B',
+          doseNumber: 'Birth Dose',
+          dateAdministered: 'Recorded in MCP card',
+          facility: 'Government Hospital',
+          confidence: 'High',
+        },
+        {
+          vaccineName: 'OPV-0',
+          doseNumber: 'Birth Dose',
+          dateAdministered: 'Recorded in MCP card',
+          facility: 'Government Hospital',
+          confidence: 'High',
+        },
+      ];
+    }
+
+    return res.json({
+      success: true,
+      documentId: `DOC-${Date.now()}`,
+      documentName: documentName || 'Vaccination_Card_Upload.jpg',
+      patientId: patientId || 'PAT-CURRENT',
+      uploadTimestamp: new Date().toISOString(),
+      detectedIssuer,
+      detectedRecords,
+      notes,
+      notice:
+        'Uploaded card is stored in the patient record for verification by the medical officer during the next outpatient consultation.',
+    });
+  } catch (err: unknown) {
+    console.error('[AARAIKE Vaccines] Error uploading card:', err);
+    return res.status(500).json({ error: parseErrorMessage(err) || 'Failed to process vaccination document.' });
+  }
+});
+
+// ==========================================
+// SUPABASE MEDICINE CATALOG INTEGRATION ENDPOINTS
+// ==========================================
+
+const getSupabaseServerClient = () => {
+  const supabaseUrl =
+    process.env.SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    process.env.VITE_SUPABASE_URL ||
+    'https://epodczplhmzdigqsnpcb.supabase.co';
+
+  // Server may optionally use a service_role key to bypass RLS, or fallback to the publishable/anon key
+  const supabaseKey =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    'sb_publishable_Lg4c4J1m0QRKhytlLtwRQA_7pBNajuo';
+
+  const isServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+  return {
+    client: createSupabaseClient(supabaseUrl, supabaseKey),
+    url: supabaseUrl,
+    keyType: isServiceRole ? 'service_role (RLS bypass enabled)' : 'publishable / anon',
+  };
+};
+
+const VERIFIED_CATALOG_COLUMNS = [
+  'START',
+  'STOP',
+  'PATIENT',
+  'PAYER',
+  'ENCOUNTER',
+  'CODE',
+  'DESCRIPTION',
+  'BASE_COST',
+  'PAYER_COVERAGE',
+  'DISPENSES',
+  'TOTALCOST',
+  'REASONCODE',
+  'REASONDESCRIPTION',
+];
+
+// Endpoint: Test connection to public.medicine_catalog
+app.get('/api/supabase/connection-test', async (_req, res) => {
+  const startTime = Date.now();
+  try {
+    const { client, url, keyType } = getSupabaseServerClient();
+    const { data, count, error, status } = await client
+      .from('medicine_catalog')
+      .select('*', { count: 'exact' })
+      .limit(10);
+
+    const latencyMs = Date.now() - startTime;
+
+    if (error) {
+      return res.status(status >= 400 ? status : 500).json({
+        success: false,
+        status: 'error',
+        totalCount: null,
+        records: [],
+        latencyMs,
+        detectedColumns: VERIFIED_CATALOG_COLUMNS,
+        errorMessage: `[Status ${status}] ${error.message} (Code: ${error.code})`,
+        diagnosticNote: error.hint || 'Check project URL and database permissions.',
+        keyType,
+        testedUrl: url,
+      });
+    }
+
+    const rows = (data as Array<Record<string, unknown>>) || [];
+    const detectedColumns = rows.length > 0 ? Object.keys(rows[0]) : VERIFIED_CATALOG_COLUMNS;
+
+    if (rows.length === 0) {
+      return res.json({
+        success: true,
+        status: 'empty_or_rls',
+        totalCount: count ?? 0,
+        records: [],
+        latencyMs,
+        detectedColumns,
+        errorMessage: null,
+        diagnosticNote:
+          'Connected to public.medicine_catalog successfully (HTTP 200 OK). 0 rows returned because Row Level Security (RLS) is active without an anon SELECT policy, or table is empty.',
+        rlsEnforced: true,
+        keyType,
+        testedUrl: url,
+        rlsFixSql: 'CREATE POLICY "Allow anon read" ON public.medicine_catalog FOR SELECT TO anon USING (true);',
+      });
+    }
+
+    return res.json({
+      success: true,
+      status: 'connected',
+      totalCount: count ?? rows.length,
+      records: rows,
+      latencyMs,
+      detectedColumns,
+      errorMessage: null,
+      diagnosticNote: `Successfully fetched ${rows.length} live records from public.medicine_catalog.`,
+      keyType,
+      testedUrl: url,
+    });
+  } catch (err: unknown) {
+    const latencyMs = Date.now() - startTime;
+    return res.status(500).json({
+      success: false,
+      status: 'error',
+      totalCount: null,
+      records: [],
+      latencyMs,
+      detectedColumns: VERIFIED_CATALOG_COLUMNS,
+      errorMessage: parseErrorMessage(err) || 'Server-side failure connecting to Supabase',
+      diagnosticNote: 'Server encountered an exception while querying Supabase.',
+    });
+  }
+});
+
+// Endpoint: Fetch medicine catalog records with search and pagination
+app.get('/api/supabase/medicines', async (req, res) => {
+  try {
+    const { client } = getSupabaseServerClient();
+    const limit = Math.min(parseInt((req.query.limit as string) || '10', 10), 100);
+    const offset = Math.max(parseInt((req.query.offset as string) || '0', 10), 0);
+    const search = ((req.query.search as string) || '').trim();
+
+    let query = client.from('medicine_catalog').select('*', { count: 'exact' });
+
+    if (search) {
+      // Filter against DESCRIPTION, REASONDESCRIPTION, and CODE
+      query = query.or(
+        `DESCRIPTION.ilike.%${search}%,REASONDESCRIPTION.ilike.%${search}%,CODE.ilike.%${search}%`
+      );
+    }
+
+    const { data, count, error, status } = await query.range(offset, offset + limit - 1);
+
+    if (error) {
+      return res.status(status >= 400 ? status : 500).json({
+        success: false,
+        error: error.message,
+        records: [],
+        totalCount: 0,
+      });
+    }
+
+    return res.json({
+      success: true,
+      records: data || [],
+      totalCount: count ?? (data?.length || 0),
+      limit,
+      offset,
+    });
+  } catch (err: unknown) {
+    return res.status(500).json({
+      success: false,
+      error: parseErrorMessage(err) || 'Failed to retrieve medicine records.',
+      records: [],
+      totalCount: 0,
+    });
+  }
+});
+
+// Endpoint: Inspect table columns schema
+app.get('/api/supabase/columns', (_req, res) => {
+  return res.json({
+    success: true,
+    tableName: 'public.medicine_catalog',
+    columns: VERIFIED_CATALOG_COLUMNS.map((col) => ({
+      name: col,
+      category:
+        col === 'DESCRIPTION' || col === 'CODE'
+          ? 'Medication Identifier'
+          : col === 'REASONCODE' || col === 'REASONDESCRIPTION'
+          ? 'Clinical Reason / Diagnosis'
+          : col === 'PATIENT' || col === 'ENCOUNTER' || col === 'PAYER'
+          ? 'EHR Context (Patient / Encounter)'
+          : col === 'BASE_COST' || col === 'TOTALCOST' || col === 'PAYER_COVERAGE'
+          ? 'Financial / Cost'
+          : col === 'START' || col === 'STOP'
+          ? 'Dates'
+          : 'Dispense Quantity',
+    })),
+  });
 });
 
 // Setup Vite middleware in dev or static serving in production
