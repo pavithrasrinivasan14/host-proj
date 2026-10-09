@@ -1,0 +1,11 @@
+{
+  "name": "Remix Remix AARAIKE - Multilingual Healthcare Accessibility Companion",
+  "description": "AI-powered healthcare accessibility companion for rural and underserved communities in India. Understand medical prescriptions in 12 regional languages with speech playback and verified image text extraction.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
